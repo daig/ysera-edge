@@ -1,21 +1,16 @@
 "use client"
 
+import type React from "react"
+
 import { useState, useRef, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
-import { Loader2, ArrowRight, Mic, MicOff, Play, Download } from "lucide-react"
+import { Loader2, ArrowRight, Mic, MicOff, Play, Download, Upload, StopCircle } from "lucide-react"
 import AuthCheck from "@/components/auth-check"
 import { exportToZip, type ExportData } from "@/utils/file-export"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useToast } from "@/components/ui/use-toast"
 import { Toaster } from "@/components/ui/toaster"
-
-// Stub function for transcription
-const transcribeAudio = async (audioBlob: Blob): Promise<string> => {
-  // Simulate transcription delay
-  await new Promise((resolve) => setTimeout(resolve, 2000))
-  return "This is a stub transcription of the audio. Replace this with actual transcription later."
-}
 
 export default function Dashboard() {
   const [input, setInput] = useState("")
@@ -25,10 +20,12 @@ export default function Dashboard() {
   const [audioURL, setAudioURL] = useState<string | null>(null)
   const [isTranscribing, setIsTranscribing] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
+  const [isPlaying, setIsPlaying] = useState(false)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const audioBlobRef = useRef<Blob | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const { toast } = useToast()
 
   // Use the secure API route instead of direct AI SDK call
@@ -68,34 +65,56 @@ export default function Dashboard() {
 
   const startRecording = async () => {
     try {
+      // Clear previous recording data
       audioChunksRef.current = []
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+
+      // Get audio stream with higher quality settings
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      })
+
+      // Create MediaRecorder with default settings - this worked before
       const mediaRecorder = new MediaRecorder(stream)
 
+      // Event handler for data available
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
           audioChunksRef.current.push(event.data)
         }
       }
 
+      // Event handler for when recording stops
       mediaRecorder.onstop = () => {
         const audioBlob = new Blob(audioChunksRef.current, { type: "audio/wav" })
-        audioBlobRef.current = audioBlob // Store the blob for export
+
+        // Clean up previous URL if it exists
+        if (audioURL) {
+          URL.revokeObjectURL(audioURL)
+        }
+
+        // Create new URL for the audio blob
         const audioUrl = URL.createObjectURL(audioBlob)
         setAudioURL(audioUrl)
 
-        // Create audio element for playback
-        if (audioRef.current) {
-          audioRef.current.src = audioUrl
-        }
+        // Store the blob for export and playback
+        audioBlobRef.current = audioBlob
 
-        // Automatically start transcription
-        handleTranscription(audioBlob)
+        // Start transcription with original recorded audio
+        handleRecordingTranscription(audioBlob)
       }
 
+      // Store the MediaRecorder reference
       mediaRecorderRef.current = mediaRecorder
+
+      // Start recording - using original parameters
       mediaRecorder.start()
       setIsRecording(true)
+
+      console.log("Recording started")
     } catch (error) {
       console.error("Error starting recording:", error)
       toast({
@@ -108,36 +127,237 @@ export default function Dashboard() {
 
   const stopRecording = () => {
     if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop()
-      setIsRecording(false)
+      try {
+        // Stop the MediaRecorder
+        mediaRecorderRef.current.stop()
+        setIsRecording(false)
 
-      // Stop all audio tracks
-      mediaRecorderRef.current.stream.getTracks().forEach((track) => track.stop())
+        // Stop all audio tracks
+        mediaRecorderRef.current.stream.getTracks().forEach((track) => {
+          track.stop()
+        })
+
+        console.log("Recording stopped manually")
+      } catch (error) {
+        console.error("Error stopping recording:", error)
+      }
     }
   }
 
   const playAudio = () => {
-    if (audioRef.current) {
-      audioRef.current.play()
+    if (!audioRef.current || !audioURL) return
+
+    if (isPlaying) {
+      // Stop playback
+      audioRef.current.pause()
+      audioRef.current.currentTime = 0
+      setIsPlaying(false)
+    } else {
+      // Start playback
+      audioRef.current.src = audioURL
+      audioRef.current
+        .play()
+        .then(() => {
+          setIsPlaying(true)
+        })
+        .catch((error) => {
+          console.error("Error playing audio:", error)
+          toast({
+            title: "Playback Error",
+            description: "Could not play the audio. Please try again.",
+            variant: "destructive",
+          })
+        })
     }
   }
 
-  const handleTranscription = async (audioBlob: Blob) => {
+  // Handle file upload for transcription
+  const handleFileUpload = () => {
+    // Trigger the hidden file input
+    if (fileInputRef.current) {
+      fileInputRef.current.click()
+    }
+  }
+
+  // Process the selected audio file
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files
+    if (!files || files.length === 0) return
+
+    const file = files[0]
+
+    // Check if it's an audio file
+    if (!file.type.startsWith("audio/")) {
+      toast({
+        title: "Invalid File Type",
+        description: "Please upload an audio file (MP3, WAV, M4A, etc.).",
+        variant: "destructive",
+      })
+      return
+    }
+
+    // Check file size (25MB limit for OpenAI)
+    const MAX_FILE_SIZE = 25 * 1024 * 1024 // 25MB in bytes
+    if (file.size > MAX_FILE_SIZE) {
+      toast({
+        title: "File Too Large",
+        description: "Audio file must be less than 25MB. Please upload a smaller file.",
+        variant: "destructive",
+      })
+      return
+    }
+
+    try {
+      console.log(`Processing uploaded audio file: ${file.name}, size: ${file.size} bytes, type: ${file.type}`)
+
+      // Clean up previous URL if it exists
+      if (audioURL) {
+        URL.revokeObjectURL(audioURL)
+      }
+
+      // Create a URL for the audio file for playback
+      const audioUrl = URL.createObjectURL(file)
+      setAudioURL(audioUrl)
+
+      // Store the blob for export and playback
+      audioBlobRef.current = file
+
+      // Start transcription with the uploaded file
+      handleFileTranscription(file)
+
+      // Reset the file input for future uploads
+      if (fileInputRef.current) {
+        fileInputRef.current.value = ""
+      }
+    } catch (error) {
+      console.error("Error processing uploaded file:", error)
+      toast({
+        title: "File Processing Error",
+        description: "Failed to process the uploaded audio file. Please try a different file.",
+        variant: "destructive",
+      })
+    }
+  }
+
+  // Separate functions for recording and file transcription to avoid conflicts
+  const handleRecordingTranscription = async (audioBlob: Blob) => {
     setIsTranscribing(true)
     try {
-      const text = await transcribeAudio(audioBlob)
+      console.log(`Preparing to transcribe recorded audio: ${audioBlob.size} bytes, type: ${audioBlob.type}`)
+
+      // Create a FormData object to send the audio file
+      const formData = new FormData()
+
+      // Add the audio blob as a file
+      formData.append("audio", audioBlob, "recording.wav")
+
+      console.log(`Sending recorded audio for transcription`)
+
+      // Call our transcription API with a longer timeout
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 60000) // 60 second timeout
+
+      const response = await fetch("/api/transcribe", {
+        method: "POST",
+        body: formData,
+        signal: controller.signal,
+      })
+
+      clearTimeout(timeoutId)
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: "Failed to parse error response" }))
+        throw new Error(errorData.error || `Server error: ${response.status}`)
+      }
+
+      const data = await response.json()
+      const transcribedText = data.text
+
+      console.log(`Transcription of recording successful: ${transcribedText.length} characters`)
 
       // Append transcribed text to existing input or replace if empty
       if (input.trim()) {
-        setInput((prev) => prev + " " + text)
+        setInput((prev) => prev + " " + transcribedText)
       } else {
-        setInput(text)
+        setInput(transcribedText)
       }
-    } catch (error) {
-      console.error("Error transcribing audio:", error)
+
       toast({
-        title: "Transcription Error",
-        description: "Failed to transcribe audio. Please try again or type your description.",
+        title: "Transcription Complete",
+        description: `Successfully transcribed recording (${transcribedText.length} characters).`,
+      })
+    } catch (error) {
+      console.error("Error transcribing recording:", error)
+      toast({
+        title: "Recording Transcription Error",
+        description:
+          error instanceof Error && error.name === "AbortError"
+            ? "Transcription timed out. Your recording may be too long."
+            : "Failed to transcribe recording. Please try again or type your description.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsTranscribing(false)
+    }
+  }
+
+  // Separate function for handling file transcription
+  const handleFileTranscription = async (audioFile: File) => {
+    setIsTranscribing(true)
+    try {
+      console.log(
+        `Preparing to transcribe uploaded file: ${audioFile.name}, ${audioFile.size} bytes, type: ${audioFile.type}`,
+      )
+
+      // Create a FormData object to send the audio file
+      const formData = new FormData()
+
+      // Add the audio file with its original name
+      formData.append("audio", audioFile, audioFile.name)
+
+      console.log(`Sending uploaded file for transcription`)
+
+      // Call our transcription API with a longer timeout
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 60000) // 60 second timeout
+
+      const response = await fetch("/api/transcribe", {
+        method: "POST",
+        body: formData,
+        signal: controller.signal,
+      })
+
+      clearTimeout(timeoutId)
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: "Failed to parse error response" }))
+        throw new Error(errorData.error || `Server error: ${response.status}`)
+      }
+
+      const data = await response.json()
+      const transcribedText = data.text
+
+      console.log(`Transcription of uploaded file successful: ${transcribedText.length} characters`)
+
+      // Append transcribed text to existing input or replace if empty
+      if (input.trim()) {
+        setInput((prev) => prev + " " + transcribedText)
+      } else {
+        setInput(transcribedText)
+      }
+
+      toast({
+        title: "Transcription Complete",
+        description: `Successfully transcribed uploaded file (${transcribedText.length} characters).`,
+      })
+    } catch (error) {
+      console.error("Error transcribing uploaded file:", error)
+      toast({
+        title: "File Transcription Error",
+        description:
+          error instanceof Error && error.name === "AbortError"
+            ? "Transcription timed out. Your file may be too long."
+            : "Failed to transcribe uploaded file. Please try a different file or type your description.",
         variant: "destructive",
       })
     } finally {
@@ -183,15 +403,47 @@ export default function Dashboard() {
     }
   }
 
-  // Create audio element on component mount
+  // Create audio element on component mount and handle audio events
   useEffect(() => {
-    audioRef.current = new Audio()
+    // Create audio element if it doesn't exist
+    if (!audioRef.current) {
+      audioRef.current = new Audio()
 
+      // Add event listeners for audio playback
+      audioRef.current.addEventListener("ended", () => {
+        setIsPlaying(false)
+      })
+
+      audioRef.current.addEventListener("error", (e) => {
+        console.error("Audio playback error:", e)
+        setIsPlaying(false)
+      })
+    }
+
+    // Clean up on unmount
     return () => {
-      // Clean up on unmount
+      if (audioRef.current) {
+        audioRef.current.pause()
+        audioRef.current.removeEventListener("ended", () => {
+          setIsPlaying(false)
+        })
+        audioRef.current.removeEventListener("error", (e) => {
+          console.error("Audio playback error:", e)
+          setIsPlaying(false)
+        })
+      }
+
       if (audioURL) {
         URL.revokeObjectURL(audioURL)
       }
+    }
+  }, [audioURL])
+
+  // Update audio source when URL changes
+  useEffect(() => {
+    if (audioRef.current && audioURL) {
+      audioRef.current.src = audioURL
+      audioRef.current.load()
     }
   }, [audioURL])
 
@@ -243,17 +495,49 @@ export default function Dashboard() {
             <div className="flex items-center justify-between mb-2">
               <h2 className="text-lg font-medium">Experiment Description</h2>
               <div className="flex items-center gap-2">
+                {/* Hidden file input for audio upload */}
+                <input type="file" ref={fileInputRef} onChange={handleFileChange} accept="audio/*" className="hidden" />
+
+                {/* Upload audio button */}
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={handleFileUpload}
+                        disabled={isRecording || isTranscribing}
+                        className="h-8 px-2"
+                      >
+                        <Upload className="h-4 w-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>Upload audio file for transcription</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+
+                {/* Record audio button */}
                 {!isRecording ? (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={startRecording}
-                    disabled={isTranscribing}
-                    className="h-8 px-2"
-                    title="Record Audio"
-                  >
-                    <Mic className="h-4 w-4" />
-                  </Button>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={startRecording}
+                          disabled={isTranscribing}
+                          className="h-8 px-2"
+                        >
+                          <Mic className="h-4 w-4" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p>Record audio</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
                 ) : (
                   <Button
                     variant="ghost"
@@ -266,16 +550,32 @@ export default function Dashboard() {
                   </Button>
                 )}
 
+                {/* Play/Stop audio button */}
                 {audioURL && !isRecording && !isTranscribing && (
-                  <Button variant="ghost" size="sm" onClick={playAudio} className="h-8 px-2" title="Play Recording">
-                    <Play className="h-4 w-4" />
-                  </Button>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={playAudio}
+                          className={`h-8 px-2 ${isPlaying ? "text-red-600 hover:text-red-700 hover:bg-red-50" : ""}`}
+                        >
+                          {isPlaying ? <StopCircle className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p>{isPlaying ? "Stop audio" : "Play audio"}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
                 )}
 
+                {/* Transcribing indicator */}
                 {isTranscribing && (
                   <div className="flex items-center gap-1 text-sm text-muted-foreground">
                     <Loader2 className="h-3 w-3 animate-spin" />
-                    <span className="sr-only">Transcribing...</span>
+                    <span>Transcribing...</span>
                   </div>
                 )}
 
