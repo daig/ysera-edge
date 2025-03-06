@@ -1,0 +1,21 @@
+{
+  "buildCommand": "cd frontend && npm run build",
+  "installCommand": "cd frontend && npm install --legacy-peer-deps",
+  "outputDirectory": "frontend/.next",
+  "functions": {
+    "api/generate_methods.py": {
+      "memory": 1024,
+      "maxDuration": 10
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/generate-methods",
+      "destination": "/api/generate_methods.py"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/frontend/$1"
+    }
+  ]
+} 
